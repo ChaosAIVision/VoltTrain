@@ -1,0 +1,56 @@
+model:
+  model_name_or_path: "Qwen/Qwen3-4B-Thinking-2507"
+  load_4bit: True
+  load_8bit: False
+  load_fp8: False
+  load_fp4: False
+ 
+lora:
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_bias: "none"
+  lora_task_type: "CAUSAL_LM"
+  full_finetuning: False
+
+
+dataset:
+  dataset_name_or_path: "mlabonne/FineTome-100k"
+  dataset_type: "huggingface"
+  split: "train[:1000]"
+
+
+training:
+  train_batch_size: 1
+  eval_batch_size: 1
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: True
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  max_grad_norm: 0.5
+  max_steps: -1
+  warmup_steps: 100
+  logging_steps: 10
+  save_steps: 1000
+  save_total_limit: 10
+  eval_steps: 1000
+  eval_accumulation_steps: 1
+  eval_delay: 0
+  fp16: False
+  bf16: True
+  tf32: False
+  local_rank: -1
+  ddp_backend: "nccl"
+  ddp_find_unused_parameters: False
+  ddp_timeout: 1800
+  ddp_bucket_cap_mb: 25
+  ddp_broadcast_buffers: False
+  gpu_devices: [0]
+  wandb_project: ""
+  wandb_run_name: ""
+  epochs: 3
+  output_dir: "outputs"
+  num_checkpoint: -1
+  muon_lr: 0.005
+  muon_momentum: 0.95

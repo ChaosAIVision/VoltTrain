@@ -1,11 +1,14 @@
 
 import torch
 import pytorch_lightning as pl
+from typing import Optional
 from transformers import (
     AutoModelForCausalLM
 )
 
 from .optimizer import Muon
+
+from bitsandbytes.optim import Adam8bit
 
 class LiSFT(pl.LightningModule):
 
@@ -40,11 +43,12 @@ class LiSFT(pl.LightningModule):
         self.train_losses = []
         self.num_tokens_seen = 0    
 
-    def compute_loss(self, model, return_outputs=False):
+    def compute_loss(self, model, batch, return_outputs=False):
         """
         Compute loss using custom function or default to model's compute_loss.
         """
-        outputs = model(**inputs) # Using huggingface's compute_loss
+        outputs = model(**batch)
+        loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
         return (loss, outputs) if return_outputs else loss
 
 
@@ -54,6 +58,11 @@ class LiSFT(pl.LightningModule):
         loss = self.compute_loss(self.model, batch, return_outputs=False)
         valid_tokens = (batch['labels'] != -100).sum()
         self.num_tokens_seen += valid_tokens
+        
+        # Check for NaN or inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"WARNING: NaN/Inf loss detected at step {batch_idx}. Skipping batch.")
+            return None
 
         # Log metrics
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -73,90 +82,117 @@ class LiSFT(pl.LightningModule):
 
         return loss
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Apply gradient clipping after backward pass"""
+    def on_before_optimizer_step(self, optimizer):
+        """Apply gradient clipping and check for NaN gradients"""
         if self.grad_clip > 0.0:
+            # Clip gradients
             torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
-
-    def configure_optimizers(self):
-
-        # Group parameters by type
-        unembedding_params = []
-        embedding_params = []
-        matrix_params = []
-
-        # Group parameters by type
+        
+        # Check for NaN gradients
         for name, param in self.named_parameters():
-            if 'lm_head' in name or 'score' in name:
-                unembedding_params.append(param)
-            elif 'embed' in name or 'wte' in name or 'wpe' in name:
-                embedding_params.append(param)
-            else:
-                matrix_params.append(param)
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    print(f"WARNING: NaN/Inf gradient in {name}. Setting to zero.")
+                    param.grad.zero_()
 
-        optimizers = []
+    # Use adam8bit optimizer 
+    def configure_optimizers(self):
+        # Use 8-bit Adam optimizer from bitsandbytes
+        optimizer = Adam8bit(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay
+        )
+        return optimizer
 
+    # def configure_optimizers(self):
 
-        param_groups = []
-        if unembedding_params:
-            param_groups.append({
-                'params': unembedding_params, 
-                'lr': self.unembedding_lr,
-                'weight_decay': self.weight_decay
-            })
-        if embedding_params:
-            param_groups.append({
-                'params': embedding_params, 
-                'lr': self.embedding_lr,
-                'weight_decay': self.weight_decay
-            })
-        if matrix_params:
-            param_groups.append({
-                'params': matrix_params, 
-                'lr': self.matrix_lr,
-                'weight_decay': self.weight_decay
-            })
+    #     # Group parameters by type
+    #     unembedding_params = []
+    #     embedding_params = []
+    #     matrix_params = []
 
-        # Add Muon optimizer for matrix parameters if enabled
-        muon_optimizer = Muon(
-                    matrix_params, 
-                    lr=self.muon_lr, 
-                    momentum=self.muon_momentum
-                )
-                optimizers.append(muon_optimizer)
+    #     # Group parameters by type
+    #     for name, param in self.named_parameters():
+    #         if 'lm_head' in name or 'score' in name:
+    #             unembedding_params.append(param)
+    #         elif 'embed' in name or 'wte' in name or 'wpe' in name:
+    #             embedding_params.append(param)
+    #         else:
+    #             matrix_params.append(param)
+
+    #     optimizers = []
 
 
-        # Store initial learning rates for scheduling
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
+    #     param_groups = []
+    #     if unembedding_params:
+    #         param_groups.append({
+    #             'params': unembedding_params, 
+    #             'lr': self.unembedding_lr,
+    #             'weight_decay': self.weight_decay
+    #         })
+    #     if embedding_params:
+    #         param_groups.append({
+    #             'params': embedding_params, 
+    #             'lr': self.embedding_lr,
+    #             'weight_decay': self.weight_decay
+    #         })
+    #     if matrix_params:
+    #         param_groups.append({
+    #             'params': matrix_params, 
+    #             'lr': self.matrix_lr,
+    #             'weight_decay': self.weight_decay
+    #         })
+
+    #     # Add Muon optimizer for matrix parameters if enabled
+    #     if self.use_muon and matrix_params:
+    #         muon_optimizer = Muon(
+    #             matrix_params, 
+    #             lr=self.muon_lr, 
+    #             momentum=self.muon_momentum
+    #         )
+    #         optimizers.append(muon_optimizer)
+    #     else:
+    #         # Use standard optimizer if Muon is not enabled
+    #         standard_optimizer = torch.optim.AdamW(
+    #             param_groups,
+    #             lr=self.lr,
+    #             weight_decay=self.weight_decay
+    #         )
+    #         optimizers.append(standard_optimizer)
 
 
-        return optimizers
+    #     # Store initial learning rates for scheduling
+    #     for opt in optimizers:
+    #         for group in opt.param_groups:
+    #             group["initial_lr"] = group["lr"]
 
 
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx):
-        """Custom optimizer step with learning rate scheduling"""
-        # Apply learning rate multiplier (can be customized)
-        lr_multiplier = self.get_lr_multiplier(self.global_step)
+    #     return optimizers
+
+
+    # def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx):
+    #     """Custom optimizer step with learning rate scheduling"""
+    #     # Apply learning rate multiplier (can be customized)
+    #     lr_multiplier = self.get_lr_multiplier(self.global_step)
         
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lr_multiplier
+    #     for group in optimizer.param_groups:
+    #         group["lr"] = group["initial_lr"] * lr_multiplier
         
-        # Call the default optimizer step
-        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_idx)
+    #     # Call the default optimizer step
+    #     super().optimizer_step(epoch, batch_idx, optimizer, optimizer_idx)
 
-    def get_lr_multiplier(self, step: int) -> float:
-        """Learning rate scheduling - can be customized"""
-        # Simple warmup + cosine decay
-        warmup_steps = getattr(self, 'warmup_steps', 100)
-        total_steps = getattr(self, 'total_steps', 10000)
+    # def get_lr_multiplier(self, step: int) -> float:
+    #     """Learning rate scheduling - can be customized"""
+    #     # Simple warmup + cosine decay
+    #     warmup_steps = getattr(self, 'warmup_steps', 100)
+    #     total_steps = getattr(self, 'total_steps', 10000)
         
-        if step < warmup_steps:
-            return step / warmup_steps
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
+    #     if step < warmup_steps:
+    #         return step / warmup_steps
+    #     else:
+    #         progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    #         return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
 
             
 

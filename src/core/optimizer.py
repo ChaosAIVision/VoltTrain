@@ -47,12 +47,29 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        """Performs a single optimization step.
+        
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
         for group in self.param_groups:
             params = group["params"]
             for p in params:
                 g = p.grad
-                assert g is not None
+                if g is None:
+                    continue
+                
+                # Check for NaN/Inf in gradients
+                if torch.isnan(g).any() or torch.isinf(g).any():
+                    print(f"WARNING: Skipping parameter update due to NaN/Inf gradient")
+                    continue
                 
                 state = self.state[p]
                 if "momentum_buffer" not in state:
@@ -63,8 +80,20 @@ class Muon(torch.optim.Optimizer):
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 
                 # Apply Newton-Schulz orthogonalization
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                try:
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                except Exception as e:
+                    print(f"WARNING: NS5 failed, using gradient directly: {e}")
+                    # Fall back to regular gradient if NS5 fails
+                    pass
+                
+                # Check again after NS5
+                if torch.isnan(g).any() or torch.isinf(g).any():
+                    print(f"WARNING: NaN/Inf after NS5, skipping update")
+                    continue
                 
                 # Apply aspect-ratio scaled step
                 scale = max(1, p.size(-2) / p.size(-1))**0.5
                 p.add_(g, alpha=-group["lr"] * scale)
+        
+        return loss
